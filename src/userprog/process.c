@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -30,18 +31,39 @@ process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
+  char *ret, *save;  //파싱에 사용할 임시 버퍼 포인터, 재진입 가능한 파서의 상태 저장 포인터
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
+  {
     return TID_ERROR;
+  }
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  ret=palloc_get_page(0);  //파싱을 위해 별도의 페이지 버퍼 ret도 하나 더 할당
+  strlcpy(ret, fn_copy, PGSIZE);  //방금 복사한 커맨드라인을 ret으로 다시 복사
+  ret=strtok_r(ret, " ", &save);  //string.c에 있는 함수 사용  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (ret, PRI_DEFAULT, start_process, fn_copy);
+  palloc_free_page(ret);  //파싱용 임시 페이지 ret는 더 이상 필요 없으므로 해제
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
+
+  sema_down(&(thread_current()->load_sema));  //자식의 로딩 완료를 기다리기 위해 sema_down 
+
+  struct list_elem *e = list_begin(&(thread_current()->child_list));  //반복자를 현재 스레드의 child list의 첫번재 노드로 설정
+  while (e != list_end(&(thread_current()->child_list)))  //반복자가 child list의 마지막 노드가 될 때까지 반복
+  {
+    struct thread *t = list_entry(e, struct thread, child_elem);  //현재 자식 스레드 저장
+    if (t->exit_status == -1)  //로딩 실패한 경우
+    {
+      return process_wait(tid);  //자식을 기다리고 종료 코드 반환
+    }
+    e = list_next(e);  //반복자 업데이트
+  }
   return tid;
 }
 
@@ -53,6 +75,17 @@ start_process (void *file_name_)
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+  char *argv[128];  //토큰 포인터 담을 배열
+  char *ret, *save;  //파싱에 사용할 임시 버퍼 포인터, 재진입 가능한 파서의 상태 저장 포인터
+
+  ret=strtok_r(file_name, " ", &save);  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
+  int i=0;  //반복자 초기화
+  while(ret&&i<127)  //ret이 NULL이 아니고 반복자가 127 이전까지 반복  //128 아니고 127인 이유는 마지막 칸에는 NULL 들어가야 하기 때문
+  {
+    argv[i++]=ret;  //argv에 ret 저장하고 반복자 +1
+    ret=strtok_r(NULL, " ", &save);  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
+  }
+  argv[i] = NULL;  //마지막 칸에 NULL
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -60,11 +93,16 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
+  if(success)  //load 성공하면
+  {
+    argument_passing(i, argv, &if_);  //문자열, 포인터, 리턴 주소, argc, argv를 표준 레이아웃에 맞게 유저 스택에 push
+  }
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  sema_up(&(thread_current()->parent->load_sema));  //자식이 로딩 완료했으므로 sema_up 
+  if (!success)  //실패면
+    exit (-1);  //종료
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -74,6 +112,34 @@ start_process (void *file_name_)
      and jump to it. */
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
+}
+
+void argument_passing(int argc, char **argv, struct intr_frame *_if)
+{
+  for(int i=argc-1; i>=0; i--)  //스택은 낮은 주소로 자라므로 역순으로 순회
+  {
+    _if->esp-=((int)strlen(argv[i])+1);  //문자열의 길이+널 문자 자리만큼 스택 포인터 이동
+    memcpy(_if->esp, argv[i], (int)strlen(argv[i])+1);  //스택 포인터가 이동하며 생긴 자리에 문자열+널 문자 복사
+    argv[i]=(char*)_if->esp;  //이제 argv[i]는 커널 버퍼 주소가 아니라 유저 스택 내 문자열의 시작 주소를 가리키게 됨
+  }
+
+  _if->esp-=((uintptr_t)_if->esp%4+4);  //esp가 4바이트 경계에 맞춰지도록 패딩을 까는데, pdf 예시를 따라서 4만큼 더 비움
+  memset(_if->esp, 0, (uintptr_t)_if->esp%4+4);  //빈자리에 0 채우기
+
+  for(int i=argc-1; i>=0; i--)  //스택은 낮은 주소로 자라므로 역순으로 순회
+  {
+    _if->esp-=4;  //포인터 한 칸 분량 자리 만들기
+    *(char**)_if->esp=argv[i];  //그 자리에 문자열 주소 저장
+  }
+
+  _if->esp-=4;  //포인터 한 칸 분량 자리 만들기
+  *(char***)_if->esp=(char**)(_if->esp+4);  //argv 자체 주소(포인터 배열의 시작 주소) 저장
+
+  _if->esp-=4;  //argc 저장할 자리 만들기
+  *(int*)_if->esp=argc;  //argc 저장
+
+  _if->esp-=4;  //리턴 주소 저장할 자리 만들기
+  memset(_if->esp, 0, 4);  //가짜 리턴 주소(0) 저장
 }
 
 /* Waits for thread TID to die and returns its exit status.  If
@@ -88,7 +154,24 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+  struct thread *cur = thread_current();  //현재 스레드 저장
+  int exit_status = -1;  //종료 상태 변수
+
+  struct list_elem *e = list_begin(&(cur->child_list));  //반복자를 현재 스레드의 child list의 첫번재 노드로 설정
+  while (e != list_end(&(cur->child_list)))  //반복자가 child list의 마지막 노드가 될 때까지 반복
+  {
+    struct thread *t = list_entry(e, struct thread, child_elem);  //현재 자식 스레드 저장
+    if (t->tid == child_tid)  //자식 스레드의 tid가 찾던 tid와 일치하면
+    {
+      sema_down(&(t->child_sema));  //자식 스레드의 exit 시그널 받을 때까지 부모 스레드가 sleep하도록 sema_down
+      list_remove(&(t->child_elem));  //자식 리스트에서 제거해서 부모가 다시 이 자식에 대해 wait하는 것을 방지
+      exit_status = t->exit_status;  //종료 상태 저장
+      sema_up(&(t->exit_sema));  //부모가 자식을 수확했으니 이제 sema_up
+      break;  //탈출
+    }
+    e = list_next(e);  //반복자 업데이트
+  }
+  return exit_status;  //종료 상태 반환
 }
 
 /* Free the current process's resources. */
@@ -102,18 +185,33 @@ process_exit (void)
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
+  {
+    /* Correct ordering here is crucial.  We must set
+        cur->pagedir to NULL before switching page directories,
+        so that a timer interrupt can't switch back to the
+        process page directory.  We must activate the base page
+        directory before destroying the process's page
+        directory, or our active page directory will be one
+        that's been freed (and cleared). */
+    cur->pagedir = NULL;
+    pagedir_activate (NULL);
+    pagedir_destroy (pd);
+  }
+
+  sema_up(&(cur->child_sema));  //자식이 종료되었음을 부모에게 알려주기 위해 sema_up
+  file_close(cur->running);  //현재 실행중인 파일 닫기
+  struct list *file_list = &cur->file_list;  //현재 스레드의 파일 리스트 저장
+  while (!list_empty(file_list))  //파일 리스트가 완전히 빌 때까지 반복
+  {
+    struct list_elem *e = list_pop_front(file_list);  //리스트 맨 앞 노드를 pop
+    struct file_info *f_info = list_entry(e, struct file_info, elem);  //pop된 노드의 파일 정보를 저장
+    if (f_info->file != NULL)  //파일 포인터가 NULL이 아니면
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
-      cur->pagedir = NULL;
-      pagedir_activate (NULL);
-      pagedir_destroy (pd);
+      file_close(f_info->file);  //파일 닫기
     }
+    free(f_info);  //파일 정보 구조체 할당 해제
+  }
+  sema_down(&(cur->exit_sema));  //자식은 부모에게 수확될 때까지 sema_down해서 기다림
 }
 
 /* Sets up the CPU for running user code in the current
@@ -228,6 +326,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+  t->running=file;  //현재 실행 중인 파일 저장
+  file_deny_write(t->running);  //실행 중인 파일에 대한 write를 금지해 다른 프로세스나 유저가 실행 중인 파일을 덮어쓰지 못하게 막음
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -312,7 +412,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  //file_close (file);
   return success;
 }
 
