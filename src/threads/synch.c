@@ -68,8 +68,8 @@ sema_down (struct semaphore *sema)
   old_level = intr_disable ();
   while (sema->value == 0) 
     {
-      //list_push_back (&sema->waiters, &thread_current ()->elem);  //이제 세마포어의 대기 리스트에 우선순위 순서대로 스레드를 넣어야 함
-      list_insert_ordered(&sema->waiters, &thread_current()->elem, compare_priority, 0);  //세마포어 대기 리스트에 스레다그 우선순위 순서대로 삽입되도록 함
+      list_push_back (&sema->waiters, &thread_current ()->elem);  //이제 세마포어의 대기 리스트에 우선순위 순서대로 스레드를 넣어야 함
+      //list_insert_ordered(&sema->waiters, &thread_current()->elem, compare_priority, 0);  //세마포어 대기 리스트에 스레다그 우선순위 순서대로 삽입되도록 함
       thread_block ();
     }
   sema->value--;
@@ -116,11 +116,11 @@ sema_up (struct semaphore *sema)
   old_level = intr_disable ();
   if (!list_empty(&sema->waiters))
   {
-      list_sort(&sema->waiters, compare_priority, 0);  //세마포어 대기 리스트에 들어있는 스레드 우선순위에 따라 정렬
+      //list_sort(&sema->waiters, compare_priority, 0);  //세마포어 대기 리스트에 들어있는 스레드 우선순위에 따라 정렬
       thread_unblock(list_entry(list_pop_front(&sema->waiters), struct thread, elem));
   }
   sema->value++;
-  thread_yield_priority();  //running 스레드가 새로 unblock된 스레드보다 우선순위가 낮으면 양보
+  //thread_yield_priority();  //running 스레드가 새로 unblock된 스레드보다 우선순위가 낮으면 양보
   intr_set_level (old_level);
 }
 
@@ -273,7 +273,7 @@ lock_release (struct lock *lock)
       }
   }
 
-  thread_priority_update();  //우선순위 donation 후 현재 스레드 우선순위 갱신
+  //thread_priority_update();  //우선순위 donation 후 현재 스레드 우선순위 갱신
   sema_up (&lock->semaphore);
 }
 
@@ -344,8 +344,8 @@ cond_wait (struct condition *cond, struct lock *lock)
   ASSERT (lock_held_by_current_thread (lock));
   
   sema_init (&waiter.semaphore, 0);
-  //list_push_back (&cond->waiters, &waiter.elem);  //이제 세마포어의 대기 리스트에 우선순위 순서대로 스레드를 넣어야 함
-  list_insert_ordered(&cond->waiters, &waiter.elem, compare_sema, 0);  //조건변수 대기 리스트에 semaphore_elem이 우선순위 순서대로 삽입되도록 함
+  list_push_back (&cond->waiters, &waiter.elem);  //이제 세마포어의 대기 리스트에 우선순위 순서대로 스레드를 넣어야 함
+  //list_insert_ordered(&cond->waiters, &waiter.elem, compare_sema, 0);  //조건변수 대기 리스트에 semaphore_elem이 우선순위 순서대로 삽입되도록 함
   lock_release (lock);
   sema_down (&waiter.semaphore);
   lock_acquire (lock);
@@ -368,7 +368,7 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED)
 
   if (!list_empty(&cond->waiters))
   {
-      list_sort(&cond->waiters, compare_sema, 0);  //조건변수 대기 리스트에 들어있는 semaphore_elem 우선순위에 따라 정렬
+      //list_sort(&cond->waiters, compare_sema, 0);  //조건변수 대기 리스트에 들어있는 semaphore_elem 우선순위에 따라 정렬
       sema_up(&list_entry(list_pop_front(&cond->waiters), struct semaphore_elem, elem)->semaphore);
   }
 }

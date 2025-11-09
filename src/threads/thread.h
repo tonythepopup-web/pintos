@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -110,6 +111,19 @@ struct thread
 
     int nice;  //nice 수치
     int recent_cpu;  //cpu 점유율 수치
+    //project2
+    struct thread *parent;  //내 부모 스레드를 가리키는 포인터
+    struct list child_list;  //내 자식 스레드 리스트
+    struct list_elem child_elem;  //내가 다른 스레드의 자식 리스트에 들어갈 때 쓰는 연결 노드
+
+    struct semaphore child_sema;  //부모가 자식을 기다릴 때 쓰는 세마포어
+    struct semaphore load_sema;  //부모가 자식이 load되는 동안 쓰는 세마포어
+    struct semaphore exit_sema;  //부모가 자식을 제거할 때 쓰는 세마포어
+
+    int exit_status;  //자식 프로세스의 종료 상태
+    struct file *running;  //현재 실행 중인 파일
+    struct list file_list;  //이 스레드가 연 파일들의 리스트
+    int fd_count;  //현재 스레드가 다음에 할당할 파일 디스크립터 번호
   };
 
 /* If false (default), use round-robin scheduler.

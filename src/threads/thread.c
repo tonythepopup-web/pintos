@@ -207,10 +207,6 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
-  if (t->priority > thread_current()->priority) {
-    thread_yield();
-  }
-
   return tid;
 }
 
@@ -247,8 +243,8 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  //list_push_back (&ready_list, &t->elem);  //이제 리스트에 우선순위 순서대로 스레드를 넣어야 함
-  list_insert_ordered(&ready_list, &t->elem, compare_priority, 0);  //lib/kernel/list.c에 보면 있는 함수
+  list_push_back (&ready_list, &t->elem);  //이제 리스트에 우선순위 순서대로 스레드를 넣어야 함
+  //list_insert_ordered(&ready_list, &t->elem, compare_priority, 0);  //lib/kernel/list.c에 보면 있는 함수
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -320,8 +316,8 @@ thread_yield (void)
   old_level = intr_disable ();
   if (cur != idle_thread)
   {
-      //list_push_back (&ready_list, &cur->elem);  //이제 리스트에 우선순위 순서대로 스레드를 넣어야 함
-      list_insert_ordered(&ready_list, &cur->elem, compare_priority, 0);  //lib/kernel/list.c에 보면 있는 함수
+      list_push_back (&ready_list, &cur->elem);  //이제 리스트에 우선순위 순서대로 스레드를 넣어야 함
+      //list_insert_ordered(&ready_list, &cur->elem, compare_priority, 0);  //lib/kernel/list.c에 보면 있는 함수
   }
   cur->status = THREAD_READY;
   schedule ();
@@ -741,6 +737,24 @@ init_thread (struct thread *t, const char *name, int priority)
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
+  //project2
+  t->running=NULL;  //현재 실행 중인 파일 초기화
+  list_init(&t->child_list);  //자식 리스트 초기화
+  list_init(&t->file_list);  //파일 리스트 초기화
+  sema_init(&t->child_sema, 0);  //child_sema 초기화
+  sema_init(&t->load_sema, 0);  //load_sema 초기화
+  sema_init(&t->exit_sema, 0);  //exit_sema 초기화
+  t->fd_count = 2;  //0은 stdin, 1은 stdout이므로 2로 초기화
+  
+  if (strcmp(name, "main") != 0)  //main thread가 아니면
+  {
+    t->parent = running_thread();  //부모 스레드는 현재 실행 중인 스레드
+    list_push_back(&t->parent->child_list, &t->child_elem);  //부모 스레드의 child_list에 자신을 추가
+  }
+  else  //메인 스레드면
+  {
+    t->parent = NULL;  //부모 없음
+  }
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
