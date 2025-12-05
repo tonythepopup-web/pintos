@@ -3,6 +3,7 @@
 #include <syscall-nr.h>
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "vm/frame.h"
 
 struct lock file_lock;  //파일 시스템 접근 때 쓰는 락
 
@@ -208,6 +209,36 @@ syscall_handler(struct intr_frame *f)
       close((int)args0);  //파일 디스크립터를 close 함수에 전달
       break;  //탈출
     }
+
+    //Project3
+
+    case SYS_MMAP:  //esp가 SYS_MMAP이 저장된 주소를 가리키고 있으면
+    {
+      if (esp + 1 == NULL || is_kernel_vaddr(esp + 1))  //esp+1이 NULL이거나 포인터가 커널 주소 영역이면
+      {
+        exit(-1);  //종료
+      }
+      if (esp + 2 == NULL || is_kernel_vaddr(esp + 2))  //esp+2가 NULL이거나 포인터가 커널 주소 영역이면
+      {
+        exit(-1);  //종료
+      }
+      args0 = *(esp + 1);  //파일 디스크립터(fd) 저장
+      args1 = *(esp + 2);  //매핑 시작 주소(addr) 저장
+      f->eax = mmap((int)args0, (void *)args1);  //fd와 addr을 mmap 함수에 전달
+      break;  //탈출
+    }
+
+    case SYS_MUNMAP:  //esp가 SYS_MUNMAP이 저장된 주소를 가리키고 있으면
+    {
+      if (esp + 1 == NULL || is_kernel_vaddr(esp + 1))  //esp+1이 NULL이거나 포인터가 커널 주소 영역이면
+      {
+        exit(-1);  //종료
+      }
+      args0 = *(esp + 1);  //매핑 ID(mapid) 저장
+      munmap((mapid_t)args0);  //mapid를 munmap 함수에 전달
+      break;  //탈출
+    }
+    //
   }
 }
 
@@ -296,12 +327,17 @@ int filesize(int fd)
   return file_length(f_info->file);  //파일의 총 바이트 수를 반환
 }
 
+//Project3
+
 int read(int fd, void *buf, unsigned int size)
 {
   if (buf == NULL || is_kernel_vaddr(buf))  //buf가 NULL이거나 포인터가 커널 주소 영역이면
   {
     exit(-1);  //종료
   }
+  //Project3
+  pin((char *)buf, (char *)buf + size);
+  //
   lock_acquire(&file_lock);  //파일 시스템 락 획득
   if (fd == 0)  //파일 디스크립터가 0이면(stdin이면)
   {
@@ -318,11 +354,17 @@ int read(int fd, void *buf, unsigned int size)
       i++;  //반복자 업데이트
     }
     lock_release(&file_lock);  //락 풀기
+    //Project3
+    unpin((char *)buf, (char *)buf + size);
+    //
     return i;  //읽은 바이트 수 반환
   }
   if (fd == 1)  //파일 디스크립터가 1이면(stdout이면)
   {
     lock_release(&file_lock);  //락 풀기
+    //Project3
+    unpin((char *)buf, (char *)buf + size);
+    //
     return -1;  //읽기는 실패이므로 실패 반환
   }
 
@@ -330,11 +372,17 @@ int read(int fd, void *buf, unsigned int size)
   if (f_info->file == NULL)  //파일 포인터가 NULL이면
   {
     lock_release(&file_lock);  //락 풀기
+        //Project3
+    unpin((char *)buf, (char *)buf + size);
+    //
     return -1;  //실패 반환
   }
 
   int read_byte = file_read(f_info->file, buf, size);  //파일에서 size만큼 읽어서 buf로 복사
   lock_release(&file_lock);  //락 풀기
+      //Project3
+  unpin((char *)buf, (char *)buf + size);
+    //
   return read_byte;  //읽은 바이트 수 반환
 }
 
@@ -344,16 +392,21 @@ int write(int fd, const void *buf, unsigned int size)
   {
     exit(-1);  //종료
   }
+  
+  pin((char *)buf, (char *)buf + size);
+
   lock_acquire(&file_lock);  //파일 시스템 락 획득
   if (fd == 0)  //파일 디스크립터가 0이면(stdin이면)
   {
     lock_release(&file_lock);  //락 풀기
+    unpin((char *)buf, (char *)buf + size);
     return 0;  //아무것도 안 썼으니까 0 반환
   }
   if (fd == 1)  //파일 디스크립터가 1이면(stdout이면)
   {
     putbuf(buf, size);  //콘솔에 출력
     lock_release(&file_lock);  //락 풀기
+    unpin((char *)buf, (char *)buf + size);
     return size;  //적은 바이트 수 반환
   }
 
@@ -361,11 +414,13 @@ int write(int fd, const void *buf, unsigned int size)
   if (f_info->file == NULL)  //파일 포인터가 NULL이면
   {
     lock_release(&file_lock);  //락 풀기
+    unpin((char *)buf, (char *)buf + size);
     return 0;  //아무것도 안 썼으니까 0 반환
   }
 
   int write_byte = file_write(f_info->file, buf, size);  //buf에서 size만큼 복사해서 파일에 쓰기
   lock_release(&file_lock);  //락 풀기
+  unpin((char *)buf, (char *)buf + size);
   return write_byte;  //적은 바이트 수 반환
 }
 
@@ -400,3 +455,117 @@ void close(int fd)
   list_remove(&f_info->elem);  //현재 스레드의 파일 리스트에서 이 파일 정보 노드 제거
   free(f_info);  //파일 정보 구조체 동적 할당 해제
 }
+
+//Project3
+
+void pin(char *start, char *end)
+{
+  for (char *i = start; i < end; i += PGSIZE) {
+    struct page *spte = find_spte(i);
+    spte->pinned = true;
+    if (spte->is_loaded == false)
+      handle_page_fault(spte);
+  }
+}
+
+void unpin(char *start, char *end)
+{
+  for (char *i = start; i < end; i += PGSIZE)
+    find_spte(i)->pinned = false;
+}
+
+// 성공 시 map_id 리턴, 실패 시 -1 리턴
+int mmap(int fd, void *addr) {
+  // addr 시작점이 page 단위 정렬 안 되었을 경우 page 단위로 접근 불가함
+  if (addr == NULL || is_kernel_vaddr(addr) || pg_round_down (addr) != addr)
+    return -1;
+
+  // memory mapping할 파일 탐색
+  struct mmap_file *mmap_file = (struct mmap_file *)malloc(sizeof(struct mmap_file));
+  if (mmap_file == NULL)
+    return -1;
+  memset(mmap_file, 0, sizeof(struct mmap_file));
+  list_init(&mmap_file->spte_list);
+  struct file_info *f_info = search(&thread_current()->file_list, fd);
+  struct file *f = f_info->file;
+  if (f == NULL || f_info->fd == 0 || f_info->fd == 1)
+    return -1;
+  
+  // 현재 thread의 mmap_list에 mmap file 추가
+  mmap_file->file = file_reopen(f);
+  mmap_file->map_id = thread_current()->map_id_count;
+  thread_current()->map_id_count += 1;
+  list_push_back(&thread_current()->mmap_list, &mmap_file->elem);
+
+  // file을 메모리로 load
+  size_t ofs = 0;
+  size_t read_bytes = file_length(mmap_file->file);
+  if (read_bytes == 0)
+    return -1;
+  //size_t zero_bytes = PGSIZE - read_bytes % PGSIZE;
+  while (read_bytes > 0) {
+    if (find_spte(addr) != NULL)
+      return -1;
+
+    size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+    //size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+    struct page *spte = (struct page *)malloc(sizeof(struct page));
+    if (spte == NULL)
+      return -1;
+    memset(spte, 0, sizeof(struct page));
+    spte->type = VM_FILE;
+    spte->vaddr = addr;
+    spte->write_enable = true;
+    spte->file = mmap_file->file;
+    spte->offset = ofs;
+    spte->read_bytes = page_read_bytes;
+    spte->zero_bytes = PGSIZE - page_read_bytes;
+    insert_page(&thread_current()->spt, spte);
+    list_push_back(&mmap_file->spte_list, &spte->mmap_elem);
+
+    /* Advance. */
+    read_bytes -= page_read_bytes;
+    //zero_bytes -= page_zero_bytes;
+    addr += PGSIZE;
+    ofs += page_read_bytes;
+  }
+  return mmap_file->map_id;
+}
+
+void munmap(mapid_t map_id) {
+  struct mmap_file *mmap_file = find_mmap_file(map_id);
+  if (mmap_file == NULL)
+    return;
+  
+  // mmap_file의 spte_list에 존재하는 모든 spte 제거
+  // spte가 물리 페이지에 존재하고, dirty한 경우 disk에 기록
+  struct list_elem *e = list_begin(&mmap_file->spte_list);
+  while (e != list_end(&mmap_file->spte_list)) {
+    struct page *spte = list_entry(e, struct page, mmap_elem);
+    if (spte->is_loaded && pagedir_is_dirty(thread_current()->pagedir, spte->vaddr)) {
+      lock_acquire(&file_lock);
+      file_write_at(spte->file, spte->vaddr, spte->read_bytes, spte->offset);
+      lock_release(&file_lock);
+      free_frame(pagedir_get_page(thread_current()->pagedir, spte->vaddr));
+    }
+    spte->is_loaded = false;
+    e = list_remove(e);
+    delete_page(&thread_current()->spt, spte);
+  }
+
+  list_remove(&mmap_file->elem);
+  free(mmap_file);
+}
+
+// 현재 thread의 mmap_list에서 map_id에 해당하는 mmap file 찾아서 리턴
+struct mmap_file *find_mmap_file(int map_id) {
+  struct thread *t = thread_current();
+  for (struct list_elem *e = list_begin(&t->mmap_list); e != list_end(&t->mmap_list); e = list_next(e)) {
+    struct mmap_file *f = list_entry(e, struct mmap_file, elem);
+    if (f->map_id == map_id)
+      return f;
+  }
+  return NULL;
+}
+//

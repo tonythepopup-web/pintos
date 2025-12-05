@@ -57,7 +57,11 @@ static uint32_t *
 lookup_page (uint32_t *pd, const void *vaddr, bool create)
 {
   uint32_t *pt, *pde;
-
+  if (pd == NULL) {
+    printf("lookup_page: pd == NULL, thread=%s, vaddr=%p\n",
+           thread_name(), vaddr);
+    debug_backtrace ();   // 있으면
+  }
   ASSERT (pd != NULL);
 
   /* Shouldn't create new kernel virtual mappings. */

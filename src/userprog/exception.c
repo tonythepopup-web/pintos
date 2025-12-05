@@ -5,6 +5,8 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
+
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -149,10 +151,46 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  if(not_present || !user || is_kernel_vaddr(fault_addr))  //페이지가 메모리에 존재하지 않거나, 커널 모드가 아닌데 커널 영역에 접근하려 했거나, fault_error가 커널 가상 주소 영역이면
-  {
-   exit(-1);  //종료
-  }
+  //Project3
+
+  struct page *spte = find_spte(fault_addr);
+  
+   //커널 주소 접근
+   if (!user || is_kernel_vaddr(fault_addr)) {
+   exit(-1);
+      }
+
+   // 읽기 전용 페이지에 쓰기
+   if (!not_present && spte == NULL) {
+   exit(-1);
+      }
+      
+   //SPTE 못찾 찾음 페이지 등록 안된 경우 
+   if (spte == NULL) {
+      if (!is_user_vaddr(fault_addr)) {
+         exit(-1);
+      }
+   // esp 근처면 stack growth 시도
+      if (fault_addr >= f->esp - 32) {
+         if (!stack_growth(fault_addr)) {
+            exit(-1);
+         }
+      }      
+      else {
+         exit(-1);
+      }
+   }
+
+   // SPT 엔트리가 있는 경우  lazy load / swap in
+   else {
+      if (write && !spte->write_enable) {
+         exit(-1);
+      }
+      if (!handle_page_fault(spte)) {
+         exit(-1);
+      }
+   }
+      
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to

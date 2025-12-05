@@ -7,6 +7,7 @@
 #include "filesys/filesys.h"
 #include "filesys/file.h"
 #include "threads/synch.h"
+#include "vm/page.h"
 
 struct file_info  //한 스레드가 연 파일 하나를 나타내는 구조체
 {
@@ -33,4 +34,10 @@ void seek(int fd, unsigned int pos);  //파일 오프셋을 옮기는 함수
 unsigned int tell(int fd);  //현재 파일 오프셋을 반환하는 함수
 void close(int fd);  //파일을 닫는 함수
 
+
+//Project3
+int mmap(int fd, void *addr);
+void munmap(mapid_t map_id);
+struct mmap_file *find_mmap_file(int map_id);
+//
 #endif /* userprog/syscall.h */

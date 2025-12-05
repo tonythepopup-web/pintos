@@ -18,6 +18,8 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/frame.h"
+
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -86,6 +88,8 @@ start_process (void *file_name_)
     ret=strtok_r(NULL, " ", &save);  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
   }
   argv[i] = NULL;  //마지막 칸에 NULL
+
+  page_init(&thread_current()->spt); // spt 초기화
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -195,11 +199,14 @@ process_exit (void)
         that's been freed (and cleared). */
     cur->pagedir = NULL;
     pagedir_activate (NULL);
+    //Project3
     pagedir_destroy (pd);
+    //
   }
 
   sema_up(&(cur->child_sema));  //자식이 종료되었음을 부모에게 알려주기 위해 sema_up
   file_close(cur->running);  //현재 실행중인 파일 닫기
+  page_destroy(&cur->spt);
   struct list *file_list = &cur->file_list;  //현재 스레드의 파일 리스트 저장
   while (!list_empty(file_list))  //파일 리스트가 완전히 빌 때까지 반복
   {
@@ -497,24 +504,38 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
       /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
+      // uint8_t *kpage = palloc_get_page (PAL_USER);
+      // if (kpage == NULL)
+      //   return false;
+
+      // /* Load this page. */
+      // if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+      //   {
+      //     palloc_free_page (kpage);
+      //     return false; 
+      //   }
+      // memset (kpage + page_read_bytes, 0, page_zero_bytes);
+      // /* Add the page to the process's address space. */
+      // if (!install_page (upage, kpage, writable)) 
+      //   {
+      //     palloc_free_page (kpage);
+      //     return false; 
+      //   }
+      
+      // Project3 (기존에 디스크에서 읽어서 물리메모리 기록 -> page fault 나면 읽어서 옴)
+      
+      struct page *spte = (struct page *)malloc(sizeof(struct page));
+      if (spte == NULL)
         return false;
-
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
+      memset(spte, 0, sizeof(struct page));
+      spte->type = VM_BIN;
+      spte->vaddr = upage;
+      spte->write_enable = writable;
+      spte->file = file;
+      spte->offset = ofs;
+      spte->read_bytes = page_read_bytes;
+      insert_page(&thread_current()->spt, spte);
+      //end
 
       /* Advance. */
       read_bytes -= page_read_bytes;
@@ -526,22 +547,42 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
+//Project3
+
 static bool
 setup_stack (void **esp) 
 {
-  uint8_t *kpage;
-  bool success = false;
+  struct page *spte = (struct page *)malloc(sizeof(struct page));       // 스택 페이지용 SPT 엔트리 생성
+  if (spte == NULL)                                                     
+    return false;                                                       
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
+  struct frame *kpage = alloc_frame (PAL_USER | PAL_ZERO);              // 0으로 초기화된 사용자 프레임 할당
+  if (kpage != NULL)                                                    
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        palloc_free_page (kpage);
+      kpage->spte = spte;                                               // 프레임과 SPT 엔트리 서로 연결
+
+      bool success = install_page (                                    
+          ((uint8_t *) PHYS_BASE) - PGSIZE,                             // 스택의 최상단 페이지 매핑할 실제 물리 프레임 주소
+          kpage->kaddr,                                                  
+          true);                                                        
+
+      if (success)                                                      
+        *esp = PHYS_BASE;                                               
+      else {                                                            
+        free_frame(kpage->kaddr);                                       // 매핑 실패하면 연결 해제
+        free(spte);                                                     
+        return success;                                                 
+      }
     }
-  return success;
+  
+  memset(spte, 0, sizeof(struct page));                                 // spte 구조체 내부 필드를 전부 0으로 초기화
+  spte->type = VM_ANON;                                                 // 스택 페이지는 타입
+  spte->vaddr = ((uint8_t *) PHYS_BASE) - PGSIZE;                       // 해당 SPT 엔트리가 담당할 가상주소
+  spte->write_enable = true;                                            // 스택은 항상 writable
+  spte->is_loaded = true;                                               // 스택 첫 페이지는 이미 물리 메모리에 로드된 상태
+  insert_page(&thread_current()->spt, spte);                            // SPT(보조 페이지 테이블)에 등록
+
+  return true;                                                          
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -563,3 +604,81 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
+//Project3
+
+bool handle_page_fault (struct page *spte) {
+  struct frame *kpage = alloc_frame(PAL_USER);
+  kpage->spte = spte;
+
+  bool success;
+  switch(spte->type) {
+    case VM_BIN:
+    case VM_FILE:
+      success = load_file(kpage->kaddr, spte);
+      if (!success) {
+        free_frame(kpage->kaddr);
+        return false;
+      }
+      memset(kpage->kaddr + spte->read_bytes, 0, spte->zero_bytes);
+      success = install_page(spte->vaddr, kpage->kaddr, spte->write_enable);
+      if (!success) {
+        free_frame(kpage->kaddr);
+        return false;
+      }
+      spte->is_loaded = true;
+      //insert_frame(kpage);
+      return true;
+
+    case VM_ANON:
+      swap_in(spte->swap_table, kpage->kaddr);
+      success = install_page(spte->vaddr, kpage->kaddr, spte->write_enable);
+      if (!success) {
+        free_frame(kpage->kaddr);
+        return false;
+      }
+      spte->is_loaded = true;
+      //insert_frame(kpage);
+      return true;
+
+    default:
+      break;
+  }
+  return false;  // not reached
+}
+
+
+bool stack_growth(void* addr){
+  if(addr < PHYS_BASE - 2048 * PGSIZE){ //stack의 최대 증가 가능 주소(8 MB)를 넘기면 false return
+    return false;
+  }
+
+  struct frame* frame;
+  struct page* spte;
+
+  for(; !find_spte(addr); addr += PGSIZE) { // 현재 addr 부터 비어있는 스택을 모두 주어진 page로 채울것임
+    frame = alloc_frame(PAL_USER | PAL_ZERO);
+    if(!frame){
+      return false;
+    }
+
+    if(!install_page(pg_round_down(addr), frame->kaddr, true)) { //frame table 설정, 실패시 frame free 후 false return
+      free_frame(frame->kaddr);
+      return false;
+    }
+
+    spte = malloc(sizeof(struct page)); //spte 할당 및 초기화
+
+    frame->spte = spte;
+    spte->type = VM_ANON;
+    spte->vaddr = pg_round_down(addr);
+    spte->write_enable = true;
+    spte->is_loaded = true;
+
+    if(!insert_page(&(frame->t->spt), spte)){
+      return false;
+    }
+  }
+  return true;
+}
+//

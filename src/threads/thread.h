@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
+#include <hash.h>
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -124,7 +125,13 @@ struct thread
     struct file *running;  //현재 실행 중인 파일
     struct list file_list;  //이 스레드가 연 파일들의 리스트
     int fd_count;  //현재 스레드가 다음에 할당할 파일 디스크립터 번호
-  };
+   
+    //Project3
+    struct hash spt;        // SPT 관리
+    struct list mmap_list;  // memory mapping된 file
+    int map_id_count;       // mmap_id  
+    //
+   };
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
