@@ -7,7 +7,6 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
-#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -16,13 +15,21 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/syscall.h"
 #include "vm/frame.h"
-
+#include "vm/page.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool install_page (void *upage, void *kpage, bool writable);
+void argument_passing(int argc, char **argv, struct intr_frame *_if);
+bool handle_page_fault (struct page *spte);
+bool stack_growth(void* addr);
+bool load_file (void *kaddr, struct page *spte);
+extern struct lock file_lock;
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -33,38 +40,35 @@ process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
-  char *ret, *save;  //파싱에 사용할 임시 버퍼 포인터, 재진입 가능한 파서의 상태 저장 포인터
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
-  {
+  if (fn_copy == NULL) {
+    palloc_free_page(fn_copy);
     return TID_ERROR;
   }
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  ret=palloc_get_page(0);  //파싱을 위해 별도의 페이지 버퍼 ret도 하나 더 할당
-  strlcpy(ret, fn_copy, PGSIZE);  //방금 복사한 커맨드라인을 ret으로 다시 복사
-  ret=strtok_r(ret, " ", &save);  //string.c에 있는 함수 사용  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
+  char *ret_ptr, *save_ptr;
+  ret_ptr = palloc_get_page(0);
+  strlcpy(ret_ptr, fn_copy, PGSIZE);
+  ret_ptr = strtok_r(ret_ptr, " ", &save_ptr);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (ret, PRI_DEFAULT, start_process, fn_copy);
-  palloc_free_page(ret);  //파싱용 임시 페이지 ret는 더 이상 필요 없으므로 해제
+  tid = thread_create (ret_ptr, PRI_DEFAULT, start_process, fn_copy);
+  palloc_free_page(ret_ptr);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
 
-  sema_down(&(thread_current()->load_sema));  //자식의 로딩 완료를 기다리기 위해 sema_down 
+  sema_down(&(thread_current()->load_sema));
 
-  struct list_elem *e = list_begin(&(thread_current()->child_list));  //반복자를 현재 스레드의 child list의 첫번재 노드로 설정
-  while (e != list_end(&(thread_current()->child_list)))  //반복자가 child list의 마지막 노드가 될 때까지 반복
+  for (struct list_elem* e = list_begin(&(thread_current()->child_list)); e != list_end(&(thread_current()->child_list)); e = list_next(e))
   {
-    struct thread *t = list_entry(e, struct thread, child_elem);  //현재 자식 스레드 저장
-    if (t->exit_status == -1)  //로딩 실패한 경우
-    {
-      return process_wait(tid);  //자식을 기다리고 종료 코드 반환
+    struct thread* thr = list_entry(e, struct thread, child_elem);
+    if (thr->exit_status == -1) {
+      return process_wait (tid);
     }
-    e = list_next(e);  //반복자 업데이트
   }
   return tid;
 }
@@ -77,19 +81,20 @@ start_process (void *file_name_)
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
-  char *argv[128];  //토큰 포인터 담을 배열
-  char *ret, *save;  //파싱에 사용할 임시 버퍼 포인터, 재진입 가능한 파서의 상태 저장 포인터
 
-  ret=strtok_r(file_name, " ", &save);  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
-  int i=0;  //반복자 초기화
-  while(ret&&i<127)  //ret이 NULL이 아니고 반복자가 127 이전까지 반복  //128 아니고 127인 이유는 마지막 칸에는 NULL 들어가야 하기 때문
-  {
-    argv[i++]=ret;  //argv에 ret 저장하고 반복자 +1
-    ret=strtok_r(NULL, " ", &save);  //공백을 구분자로 해서 첫 토큰을 ret이 가리키게 함
+  int argc = 0;
+  char *argv[128];
+  char *ret_ptr, *save_ptr;
+
+  ret_ptr = strtok_r(file_name, " ", &save_ptr);
+  
+  while(ret_ptr != NULL){
+    argv[argc] = ret_ptr;
+    argc++;
+    ret_ptr = strtok_r(NULL, " ", &save_ptr);
   }
-  argv[i] = NULL;  //마지막 칸에 NULL
 
-  page_init(&thread_current()->spt); // spt 초기화
+  page_init(&thread_current()->spt);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -97,16 +102,15 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
-  if(success)  //load 성공하면
-  {
-    argument_passing(i, argv, &if_);  //문자열, 포인터, 리턴 주소, argc, argv를 표준 레이아웃에 맞게 유저 스택에 push
-  }
+  
+  if (success)
+    argument_passing(argc, argv, &if_);
 
-  /* If load failed, quit. */
-  palloc_free_page (file_name);
-  sema_up(&(thread_current()->parent->load_sema));  //자식이 로딩 완료했으므로 sema_up 
-  if (!success)  //실패면
-    exit (-1);  //종료
+  palloc_free_page(file_name);
+  sema_up(&(thread_current()->parent->load_sema));
+  if (!success) {
+    exit(-1);
+  }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -118,32 +122,30 @@ start_process (void *file_name_)
   NOT_REACHED ();
 }
 
-void argument_passing(int argc, char **argv, struct intr_frame *_if)
-{
-  for(int i=argc-1; i>=0; i--)  //스택은 낮은 주소로 자라므로 역순으로 순회
-  {
-    _if->esp-=((int)strlen(argv[i])+1);  //문자열의 길이+널 문자 자리만큼 스택 포인터 이동
-    memcpy(_if->esp, argv[i], (int)strlen(argv[i])+1);  //스택 포인터가 이동하며 생긴 자리에 문자열+널 문자 복사
-    argv[i]=(char*)_if->esp;  //이제 argv[i]는 커널 버퍼 주소가 아니라 유저 스택 내 문자열의 시작 주소를 가리키게 됨
+void argument_passing(int argc, char **argv, struct intr_frame *_if){
+
+  for(int i = argc - 1; i >= 0; i--){
+    _if->esp -= ((int)strlen(argv[i]) + 1);
+    memcpy(_if->esp, argv[i], (int)strlen(argv[i]) + 1);
+    argv[i] = (char*)_if->esp;
+  }
+  
+  _if->esp -= ((unsigned int)_if->esp % 4 + 4);
+  memset(_if->esp, 0, (unsigned int)_if->esp % 4 + 4);
+
+  for(int i = argc - 1; i >= 0; i--){
+    _if->esp -= 4;
+    *(char**)_if->esp = argv[i];
   }
 
-  _if->esp-=((uintptr_t)_if->esp%4+4);  //esp가 4바이트 경계에 맞춰지도록 패딩을 까는데, pdf 예시를 따라서 4만큼 더 비움
-  memset(_if->esp, 0, (uintptr_t)_if->esp%4+4);  //빈자리에 0 채우기
+  _if->esp -= 4;
+  *(char**)_if->esp = _if->esp + 4;
 
-  for(int i=argc-1; i>=0; i--)  //스택은 낮은 주소로 자라므로 역순으로 순회
-  {
-    _if->esp-=4;  //포인터 한 칸 분량 자리 만들기
-    *(char**)_if->esp=argv[i];  //그 자리에 문자열 주소 저장
-  }
+  _if->esp -= 4;
+  *(int*)_if->esp = argc;
 
-  _if->esp-=4;  //포인터 한 칸 분량 자리 만들기
-  *(char***)_if->esp=(char**)(_if->esp+4);  //argv 자체 주소(포인터 배열의 시작 주소) 저장
-
-  _if->esp-=4;  //argc 저장할 자리 만들기
-  *(int*)_if->esp=argc;  //argc 저장
-
-  _if->esp-=4;  //리턴 주소 저장할 자리 만들기
-  memset(_if->esp, 0, 4);  //가짜 리턴 주소(0) 저장
+  _if->esp -= 4;
+  memset(_if->esp, 0, 4);
 }
 
 /* Waits for thread TID to die and returns its exit status.  If
@@ -158,24 +160,19 @@ void argument_passing(int argc, char **argv, struct intr_frame *_if)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  struct thread *cur = thread_current();  //현재 스레드 저장
-  int exit_status = -1;  //종료 상태 변수
-
-  struct list_elem *e = list_begin(&(cur->child_list));  //반복자를 현재 스레드의 child list의 첫번재 노드로 설정
-  while (e != list_end(&(cur->child_list)))  //반복자가 child list의 마지막 노드가 될 때까지 반복
-  {
-    struct thread *t = list_entry(e, struct thread, child_elem);  //현재 자식 스레드 저장
-    if (t->tid == child_tid)  //자식 스레드의 tid가 찾던 tid와 일치하면
-    {
-      sema_down(&(t->child_sema));  //자식 스레드의 exit 시그널 받을 때까지 부모 스레드가 sleep하도록 sema_down
-      list_remove(&(t->child_elem));  //자식 리스트에서 제거해서 부모가 다시 이 자식에 대해 wait하는 것을 방지
-      exit_status = t->exit_status;  //종료 상태 저장
-      sema_up(&(t->exit_sema));  //부모가 자식을 수확했으니 이제 sema_up
-      break;  //탈출
+  struct thread *cur = thread_current();
+  int exit_status = -1;
+  for (struct list_elem *e = list_begin(&(cur->child_list)); e != list_end(&(cur->child_list)); e = list_next(e)) {
+    struct thread *thr = list_entry(e, struct thread, child_elem);
+    if (thr->tid == child_tid) {
+      sema_down(&(thr->child_sema));
+      list_remove(&(thr->child_elem));
+      exit_status = thr->exit_status;
+      sema_up(&(thr->exit_sema));
+      break;
     }
-    e = list_next(e);  //반복자 업데이트
   }
-  return exit_status;  //종료 상태 반환
+  return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -185,40 +182,33 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  sema_up(&(cur->child_sema));
+  
+  for (int map_id = 1; map_id < cur->map_id_count; map_id++)
+    munmap(map_id);
+  
+  close_files(&cur->file_list);
+  file_close(cur->running_file);
+  page_destroy(&cur->spt);
+
+  sema_down(&(cur->exit_sema));
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
-  {
-    /* Correct ordering here is crucial.  We must set
-        cur->pagedir to NULL before switching page directories,
-        so that a timer interrupt can't switch back to the
-        process page directory.  We must activate the base page
-        directory before destroying the process's page
-        directory, or our active page directory will be one
-        that's been freed (and cleared). */
-    cur->pagedir = NULL;
-    pagedir_activate (NULL);
-    //Project3
-    pagedir_destroy (pd);
-    //
-  }
-
-  sema_up(&(cur->child_sema));  //자식이 종료되었음을 부모에게 알려주기 위해 sema_up
-  file_close(cur->running);  //현재 실행중인 파일 닫기
-  page_destroy(&cur->spt);
-  struct list *file_list = &cur->file_list;  //현재 스레드의 파일 리스트 저장
-  while (!list_empty(file_list))  //파일 리스트가 완전히 빌 때까지 반복
-  {
-    struct list_elem *e = list_pop_front(file_list);  //리스트 맨 앞 노드를 pop
-    struct file_info *f_info = list_entry(e, struct file_info, elem);  //pop된 노드의 파일 정보를 저장
-    if (f_info->file != NULL)  //파일 포인터가 NULL이 아니면
     {
-      file_close(f_info->file);  //파일 닫기
+      /* Correct ordering here is crucial.  We must set
+         cur->pagedir to NULL before switching page directories,
+         so that a timer interrupt can't switch back to the
+         process page directory.  We must activate the base page
+         directory before destroying the process's page
+         directory, or our active page directory will be one
+         that's been freed (and cleared). */
+      cur->pagedir = NULL;
+      pagedir_activate (NULL);
+      pagedir_destroy (pd);
     }
-    free(f_info);  //파일 정보 구조체 할당 해제
-  }
-  sema_down(&(cur->exit_sema));  //자식은 부모에게 수확될 때까지 sema_down해서 기다림
 }
 
 /* Sets up the CPU for running user code in the current
@@ -236,7 +226,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -327,14 +317,20 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
+  lock_acquire (&file_lock);
+
   file = filesys_open (file_name);
   if (file == NULL) 
     {
+      lock_release (&file_lock);
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
-  t->running=file;  //현재 실행 중인 파일 저장
-  file_deny_write(t->running);  //실행 중인 파일에 대한 write를 금지해 다른 프로세스나 유저가 실행 중인 파일을 덮어쓰지 못하게 막음
+
+  t->running_file = file;
+  file_deny_write(t->running_file);
+  
+  lock_release (&file_lock);
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -419,10 +415,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  //file_close (file);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -504,26 +499,24 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
       /* Get a page of memory. */
-      // uint8_t *kpage = palloc_get_page (PAL_USER);
-      // if (kpage == NULL)
-      //   return false;
+      //uint8_t *kpage = palloc_get_page (PAL_USER);
+      //if (kpage == NULL)
+      //  return false;
 
-      // /* Load this page. */
-      // if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-      //   {
-      //     palloc_free_page (kpage);
-      //     return false; 
-      //   }
-      // memset (kpage + page_read_bytes, 0, page_zero_bytes);
-      // /* Add the page to the process's address space. */
-      // if (!install_page (upage, kpage, writable)) 
-      //   {
-      //     palloc_free_page (kpage);
-      //     return false; 
-      //   }
-      
-      // Project3 (기존에 디스크에서 읽어서 물리메모리 기록 -> page fault 나면 읽어서 옴)
-      
+      /* Load this page. */
+      //if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+      //  {
+      //    palloc_free_page (kpage);
+      //    return false; 
+      //  }
+      //memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+      /* Add the page to the process's address space. */
+      //if (!install_page (upage, kpage, writable)) 
+      //  {
+      //    palloc_free_page (kpage);
+      //    return false; 
+      //  }
       struct page *spte = (struct page *)malloc(sizeof(struct page));
       if (spte == NULL)
         return false;
@@ -534,55 +527,49 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       spte->file = file;
       spte->offset = ofs;
       spte->read_bytes = page_read_bytes;
+      spte->zero_bytes = page_zero_bytes;
       insert_page(&thread_current()->spt, spte);
-      //end
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      ofs += page_read_bytes;
     }
   return true;
 }
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-//Project3
-
 static bool
 setup_stack (void **esp) 
 {
-  struct page *spte = (struct page *)malloc(sizeof(struct page));       // 스택 페이지용 SPT 엔트리 생성
-  if (spte == NULL)                                                     
-    return false;                                                       
+  struct page *spte = (struct page *)malloc(sizeof(struct page));
+  if (spte == NULL)
+    return false;
 
-  struct frame *kpage = alloc_frame (PAL_USER | PAL_ZERO);              // 0으로 초기화된 사용자 프레임 할당
-  if (kpage != NULL)                                                    
+  struct frame *kpage = alloc_frame (PAL_USER | PAL_ZERO);
+  if (kpage != NULL) 
     {
-      kpage->spte = spte;                                               // 프레임과 SPT 엔트리 서로 연결
-
-      bool success = install_page (                                    
-          ((uint8_t *) PHYS_BASE) - PGSIZE,                             // 스택의 최상단 페이지 매핑할 실제 물리 프레임 주소
-          kpage->kaddr,                                                  
-          true);                                                        
-
-      if (success)                                                      
-        *esp = PHYS_BASE;                                               
-      else {                                                            
-        free_frame(kpage->kaddr);                                       // 매핑 실패하면 연결 해제
-        free(spte);                                                     
-        return success;                                                 
+      kpage->spte = spte;
+      bool success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage->kaddr, true);
+      if (success)
+        *esp = PHYS_BASE;
+      else {
+        free_frame(kpage->kaddr);
+        free(spte);
+        return success;
       }
     }
   
-  memset(spte, 0, sizeof(struct page));                                 // spte 구조체 내부 필드를 전부 0으로 초기화
-  spte->type = VM_ANON;                                                 // 스택 페이지는 타입
-  spte->vaddr = ((uint8_t *) PHYS_BASE) - PGSIZE;                       // 해당 SPT 엔트리가 담당할 가상주소
-  spte->write_enable = true;                                            // 스택은 항상 writable
-  spte->is_loaded = true;                                               // 스택 첫 페이지는 이미 물리 메모리에 로드된 상태
-  insert_page(&thread_current()->spt, spte);                            // SPT(보조 페이지 테이블)에 등록
+  memset(spte, 0, sizeof(struct page));
+  spte->type = VM_ANON;
+  spte->vaddr = ((uint8_t *) PHYS_BASE) - PGSIZE;
+  spte->write_enable = true;
+  spte->is_loaded = true;
+  insert_page(&thread_current()->spt, spte);
 
-  return true;                                                          
+  return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -605,13 +592,11 @@ install_page (void *upage, void *kpage, bool writable)
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
 
-//Project3
-
 bool handle_page_fault (struct page *spte) {
+  bool success;
   struct frame *kpage = alloc_frame(PAL_USER);
   kpage->spte = spte;
 
-  bool success;
   switch(spte->type) {
     case VM_BIN:
     case VM_FILE:
@@ -627,7 +612,6 @@ bool handle_page_fault (struct page *spte) {
         return false;
       }
       spte->is_loaded = true;
-      //insert_frame(kpage);
       return true;
 
     case VM_ANON:
@@ -638,38 +622,36 @@ bool handle_page_fault (struct page *spte) {
         return false;
       }
       spte->is_loaded = true;
-      //insert_frame(kpage);
       return true;
 
     default:
       break;
   }
-  return false;  // not reached
+  return false;
 }
 
-
 bool stack_growth(void* addr){
-  if(addr < PHYS_BASE - 2048 * PGSIZE){ //stack의 최대 증가 가능 주소(8 MB)를 넘기면 false return
+  struct frame* frame;
+  struct page* spte;
+  
+  if(addr < PHYS_BASE - 2048 * PGSIZE){
     return false;
   }
 
-  struct frame* frame;
-  struct page* spte;
-
-  for(; !find_spte(addr); addr += PGSIZE) { // 현재 addr 부터 비어있는 스택을 모두 주어진 page로 채울것임
+  for(; !find_spte(addr); addr += PGSIZE) {
     frame = alloc_frame(PAL_USER | PAL_ZERO);
     if(!frame){
       return false;
     }
 
-    if(!install_page(pg_round_down(addr), frame->kaddr, true)) { //frame table 설정, 실패시 frame free 후 false return
+    spte = malloc(sizeof(struct page));
+    frame->spte = spte;
+    
+    if(!install_page(pg_round_down(addr), frame->kaddr, true)) {
       free_frame(frame->kaddr);
       return false;
     }
 
-    spte = malloc(sizeof(struct page)); //spte 할당 및 초기화
-
-    frame->spte = spte;
     spte->type = VM_ANON;
     spte->vaddr = pg_round_down(addr);
     spte->write_enable = true;
@@ -681,4 +663,3 @@ bool stack_growth(void* addr){
   }
   return true;
 }
-//

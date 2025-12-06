@@ -3,11 +3,14 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "filesys/file.h"
+#include "userprog/pagedir.h"
 #include <string.h>
 #include "vm/frame.h"
 
 extern struct lock file_lock;
 
+static unsigned page_hash_func (const struct hash_elem *e, void *aux);
+static bool page_less_func (const struct hash_elem *a, const struct hash_elem *b, void *aux);
 
 void page_init (struct hash *page) {
     hash_init(page, page_hash_func, page_less_func, NULL);
@@ -31,8 +34,6 @@ bool insert_page (struct hash *page, struct page *page_entry) {
         return false;
 }
 
-// swap table 구현 이후 수정 필요
-// page(spt entry) 할당 해제 구현 필요
 bool delete_page (struct hash *page, struct page *page_entry) {
     if (!hash_delete(page, &page_entry->helem))
         return false;
@@ -42,9 +43,9 @@ bool delete_page (struct hash *page, struct page *page_entry) {
 }
 
 struct page *find_spte (void *vaddr) {
-    struct hash *page = &thread_current()->spt; // 지금 실행 중인 스레드의 spt 해시테이블
+    struct hash *page = &thread_current()->spt;
     struct page spte;
-    spte.vaddr = pg_round_down(vaddr); //vaddr 이 어느 페이지에 속하는지 확인한다
+    spte.vaddr = pg_round_down(vaddr);
     struct hash_elem *elem = hash_find(page, &spte.helem);
     if (elem) {
         return hash_entry(elem, struct page, helem);
@@ -58,8 +59,6 @@ void page_destroy (struct hash *page) {
     hash_destroy(page, page_destroy_func);
 }
 
-// swap table 구현 이후 수정 필요
-// page(spt entry) 할당 해제 구현 필요
 void page_destroy_func (struct hash_elem *e, void *aux) {
     struct page *spte = hash_entry(e, struct page, helem);
     if (spte == NULL)

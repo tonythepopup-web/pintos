@@ -6,9 +6,13 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "vm/page.h"
+#include "userprog/process.h"
+#include "userprog/syscall.h"
 
+bool handle_page_fault (struct page *spte);
+bool stack_growth(void* addr);
+struct page *find_spte (void *vaddr);
 
-/* Number of page faults processed. */
 static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
@@ -150,56 +154,32 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
-
-  //Project3
+  
+  if (!not_present)
+   exit(-1);
 
   struct page *spte = find_spte(fault_addr);
   
-   //커널 주소 접근
-   if (!user || is_kernel_vaddr(fault_addr)) {
-   exit(-1);
-      }
-
-   // 읽기 전용 페이지에 쓰기
-   if (!not_present && spte == NULL) {
-   exit(-1);
-      }
-      
-   //SPTE 못찾 찾음 페이지 등록 안된 경우 
-   if (spte == NULL) {
-      if (!is_user_vaddr(fault_addr)) {
-         exit(-1);
-      }
-   // esp 근처면 stack growth 시도
-      if (fault_addr >= f->esp - 32) {
-         if (!stack_growth(fault_addr)) {
-            exit(-1);
-         }
-      }      
-      else {
+  if (!spte) {
+   if (!is_user_vaddr(fault_addr))
+      exit(-1);
+   if(fault_addr >= f->esp - 32) {
+      if(!stack_growth(fault_addr)){
          exit(-1);
       }
    }
-
-   // SPT 엔트리가 있는 경우  lazy load / swap in
-   else {
-      if (write && !spte->write_enable) {
-         exit(-1);
-      }
-      if (!handle_page_fault(spte)) {
-         exit(-1);
-      }
+   else{
+      exit(-1);
    }
-      
+  }
+  else{
+   if(write && !(spte->write_enable)){
+    exit(-1);
+   }
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+   if (!handle_page_fault(spte)){
+    exit(-1);
+   }
+  }
 }
 

@@ -23,22 +23,18 @@ struct page {
     bool pinned;
 };
 
-// mapping된 file의 정보를 저장하는 구조체
 struct mmap_file {
-    struct file* file;      // mmap_file의 file 객체
-    unsigned map_id;        // mmap_file의 id
-    struct list_elem elem;  // mmap_file list element
-    struct list spte_list;  // mmap_file에 해당하는 모든 spte
+    struct file* file;
+    unsigned map_id;
+    struct list_elem elem;
+    struct list spte_list;
 };
 
 void page_init (struct hash *page);
-static unsigned page_hash_func (const struct hash_elem *e, void *aux);
-static bool page_less_func (const struct hash_elem *a, const struct hash_elem *b, void *aux);
 bool insert_page (struct hash *page, struct page *page_entry);
 bool delete_page (struct hash *page, struct page *page_entry);
 struct page *find_spte (void *vaddr);
 void page_destroy (struct hash *page);
 void page_destroy_func (struct hash_elem *e, void *aux);
-void check_valid_buffer (void *buffer, unsigned size, void *esp, bool to_write);
 
 #endif
