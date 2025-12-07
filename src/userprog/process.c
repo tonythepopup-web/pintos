@@ -19,16 +19,20 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/syscall.h"
+#ifdef VM
 #include "vm/frame.h"
 #include "vm/page.h"
+#endif
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static bool install_page (void *upage, void *kpage, bool writable);
 void argument_passing(int argc, char **argv, struct intr_frame *_if);
+#ifdef VM
 bool handle_page_fault (struct page *spte);
 bool stack_growth(void* addr);
 bool load_file (void *kaddr, struct page *spte);
+#endif
 extern struct lock file_lock;
 
 /* Starts a new thread running a user program loaded from
@@ -94,7 +98,9 @@ start_process (void *file_name_)
     ret_ptr = strtok_r(NULL, " ", &save_ptr);
   }
 
+#ifdef VM
   page_init(&thread_current()->spt);  //실행되는 스레드의 SPT 초기화
+#endif
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -187,16 +193,20 @@ process_exit (void)
 
   sema_up(&(cur->child_sema));
   
+#ifdef VM
   int map_id = 1;  //첫 mmap 영역의 ID는 1부터 시작
   while (map_id < cur->map_id_count)  //모든 mmap된 파일에 대해 unmap 수행
   {
     munmap(map_id);  //map_id에 해당하는 mmap 영역 해제
     map_id++;  //다음 mmap 영역으로 이동
   }
+#endif
   
   close_files(&cur->file_list);
   file_close(cur->running_file);
+#ifdef VM
   page_destroy(&cur->spt);  //SPT의 모든 페이지 엔트리 및 프레임 정리
+#endif
 
   sema_down(&(cur->exit_sema));
 
@@ -505,26 +515,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;  //이번 페이지에서 읽을 바이트 수 계산
       size_t page_zero_bytes = PGSIZE - page_read_bytes;  //남은 공간은 0으로 채울 바이트 수
 
-      /* Get a page of memory. */
-      //uint8_t *kpage = palloc_get_page (PAL_USER);
-      //if (kpage == NULL)
-      //  return false;
-
-      /* Load this page. */
-      //if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-      //  {
-      //    palloc_free_page (kpage);
-      //    return false; 
-      //  }
-      //memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      //if (!install_page (upage, kpage, writable)) 
-      //  {
-      //    palloc_free_page (kpage);
-      //    return false; 
-      //  }
-
+#ifdef VM
+      /* VM enabled: lazy loading */
       struct page *spte = (struct page *)malloc(sizeof(struct page));  //SPT 엔트리 할당
       if (spte == NULL)  //할당 실패 시
         return false;
@@ -537,6 +529,27 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       spte->read_bytes = page_read_bytes;  //로드할 바이트 수
       spte->zero_bytes = page_zero_bytes;  //0으로 채울 바이트 수
       insert_page(&thread_current()->spt, spte);  //SPT에 등록
+#else
+      /* VM disabled: immediate loading */
+      uint8_t *kpage = palloc_get_page (PAL_USER);
+      if (kpage == NULL)
+        return false;
+
+      /* Load this page. */
+      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+        {
+          palloc_free_page (kpage);
+          return false; 
+        }
+      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+      /* Add the page to the process's address space. */
+      if (!install_page (upage, kpage, writable)) 
+        {
+          palloc_free_page (kpage);
+          return false; 
+        }
+#endif
 
       /* Advance. */
       read_bytes -= page_read_bytes;  //남은 읽기 바이트 감소
@@ -553,6 +566,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp) 
 {
+#ifdef VM
   struct page *spte = (struct page *)malloc(sizeof(struct page));  //스택 페이지용 SPT 엔트리 생성
   if (spte == NULL)  //SPT 엔트리 생성 실패 시
     return false;
@@ -579,6 +593,21 @@ setup_stack (void **esp)
   insert_page(&thread_current()->spt, spte);  //SPT에 스택 페이지 등록
 
   return true;  //스택 설정 성공
+#else
+  uint8_t *kpage;
+  bool success = false;
+
+  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  if (kpage != NULL) 
+    {
+      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      if (success)
+        *esp = PHYS_BASE;
+      else
+        palloc_free_page (kpage);
+    }
+  return success;
+#endif
 }
 
 
@@ -602,6 +631,7 @@ install_page (void *upage, void *kpage, bool writable)
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
 
+#ifdef VM
 bool handle_page_fault (struct page *spte) {
   bool success;  //파일 로드, 매핑 설치 등 성공 여부 저장
   struct frame *kpage = alloc_frame(PAL_USER);  //유저용 프레임 할당 (필요 시 페이지 교체 수행)
@@ -677,5 +707,6 @@ bool stack_growth(void* addr){
   }
   return true;  //스택 확장 완료
 }
+#endif
 
 

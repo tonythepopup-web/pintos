@@ -2,7 +2,9 @@
 #define USERPROG_SYSCALL_H
 #include "threads/thread.h"
 #include "lib/user/syscall.h"
+#ifdef VM
 #include "vm/page.h"
+#endif
 
 struct file_info
 {

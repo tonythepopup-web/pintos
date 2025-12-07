@@ -119,10 +119,13 @@ struct thread
     
     struct list file_list;
     int fd_count;
+    
+#ifdef VM
     //project3
     struct hash spt;   //보조 페이지 테이블
     struct list mmap_list;  //mmap으로 매핑된 영역을 관리하는 리스트
     int map_id_count;  //mmap 영역에 번호를 붙이기 위한 카운터
+#endif
   };
 
 /* If false (default), use round-robin scheduler.

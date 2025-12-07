@@ -129,8 +129,10 @@ main (void)
   filesys_init (format_filesys);
 #endif
 
+#ifdef VM
   frame_init();   //frame table 초기화
   swap_init();   //swap 영역 초기화
+#endif
 
   printf ("Boot complete.\n");
   

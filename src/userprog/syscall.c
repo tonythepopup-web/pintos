@@ -12,13 +12,17 @@
 #include "userprog/pagedir.h"
 #include "devices/input.h"
 #include "devices/shutdown.h"
+#ifdef VM
 #include "vm/frame.h"
+#endif
 
 static void syscall_handler(struct intr_frame *);
+#ifdef VM
 void pin(char *start, char *end);
 void unpin(char *start, char *end);
 bool handle_page_fault(struct page *spte);
 struct page *find_spte(void *vaddr);
+#endif
 
 struct lock file_lock;
 
@@ -210,6 +214,7 @@ syscall_handler(struct intr_frame *f UNUSED)
     close((int)args0);
     break;
 
+#ifdef VM
   case SYS_MMAP:
     if (esp + 1 == NULL || is_kernel_vaddr(esp + 1))
     {
@@ -232,6 +237,7 @@ syscall_handler(struct intr_frame *f UNUSED)
     args0 = *(esp + 1);
     munmap((mapid_t)args0);
     break;
+#endif
   }
 }
 
@@ -315,6 +321,7 @@ int filesize(int fd)
   return file_length(f);
 }
 
+#ifdef VM
 void pin(char *start, char *end)
 {
   char *i;  //페이지 단위 순회 포인터
@@ -339,6 +346,7 @@ void unpin(char *start, char *end)
     i += PGSIZE;  //다음 페이지 주소로 이동
   }
 }
+#endif
 
 int read(int fd, void *buffer, unsigned size)
 {
@@ -346,7 +354,9 @@ int read(int fd, void *buffer, unsigned size)
   {
     exit(-1);  //잘못된 주소 접근 → 프로세스 종료
   }
+#ifdef VM
   pin(buffer, buffer + size);  //read 동안 buffer의 페이지들을 pinned로 설정하여 evict 방지
+#endif
   lock_acquire(&file_lock);  //파일 시스템 보호용 락 획득
 
   if (fd == 0)  //stdin에서 입력 읽기
@@ -361,14 +371,18 @@ int read(int fd, void *buffer, unsigned size)
         break;
       idx++;  //다음 바이트로 이동
     }
+#ifdef VM
     unpin(buffer, buffer + size);  //buffer 페이지 unpin
+#endif
     lock_release(&file_lock);  //락 해제
     return idx;  //읽은 바이트 수 반환
   }
 
   if (fd == 1)  //stdout에 대해 read는 잘못된 요청
   {
+#ifdef VM
     unpin(buffer, buffer + size);  //unpin
+#endif
     lock_release(&file_lock);  //락 해제
     return -1;  //잘못된 read 호출
   }
@@ -377,13 +391,17 @@ int read(int fd, void *buffer, unsigned size)
   struct file *f = f_info->file;  //파일 포인터 획득
   if (f == NULL)  //유효하지 않은 파일
   {
+#ifdef VM
     unpin(buffer, buffer + size);  //unpin
+#endif
     lock_release(&file_lock);  //락 해제
     return -1;  //실패 반환
   }
 
   int read_size_byte = file_read(f, buffer, size);  //파일에서 size 바이트 읽기
+#ifdef VM
   unpin(buffer, buffer + size);  //buffer unpin
+#endif
   lock_release(&file_lock);  //파일 시스템 락 해제
   return read_size_byte;  //실제 읽은 바이트 수 반환
 }
@@ -394,21 +412,27 @@ int write(int fd, const void *buffer, unsigned size)
   {
     exit(-1);  //잘못된 포인터 → 종료
   }
+#ifdef VM
   pin(buffer, buffer + size);  //write 동안 buffer 페이지를 pinned로 설정
+#endif
   lock_acquire(&file_lock);  //파일 락 획득
 
   if (fd == 1)  //stdout
   {
     putbuf(buffer, size);  //콘솔로 size 바이트 출력
     lock_release(&file_lock);  //락 해제
+#ifdef VM
     unpin(buffer, buffer + size);  //unpin
+#endif
     return size;  //출력한 바이트 수 반환
   }
 
   if (fd == 0)  //stdin에 write는 의미 없음
   {
     lock_release(&file_lock);  //락 해제
+#ifdef VM
     unpin(buffer, buffer + size);  //unpin
+#endif
     return 0;  //0바이트 반환
   }
 
@@ -417,13 +441,17 @@ int write(int fd, const void *buffer, unsigned size)
   if (f == NULL)  //파일 없음
   {
     lock_release(&file_lock);  //락 해제
+#ifdef VM
     unpin(buffer, buffer + size);  //unpin
+#endif
     return 0;  //쓰기 실패
   }
 
   int write_bytes = file_write(f, buffer, size);  //파일에 size만큼 쓰기
   lock_release(&file_lock);  //파일 락 해제
+#ifdef VM
   unpin(buffer, buffer + size);  //buffer unpin
+#endif
   return write_bytes;  //실제 쓰여진 바이트 수 반환
 }
 
@@ -457,6 +485,7 @@ void close(int fd)
   free(f_info);
 }
 
+#ifdef VM
 int mmap(int fd, void *addr)
 {
   struct mmap_file *mmap_file;  //mmap 영역 정보를 저장할 구조체 포인터
@@ -566,4 +595,5 @@ struct mmap_file *find_mmap_file(int map_id)
   }
   return NULL;  //일치하는 map_id가 없으면 NULL 반환
 }
+#endif
 
