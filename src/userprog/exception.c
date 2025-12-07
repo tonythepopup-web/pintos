@@ -4,8 +4,15 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "vm/page.h"
+#include "userprog/process.h"
+#include "userprog/syscall.h"
 
-/* Number of page faults processed. */
+bool handle_page_fault (struct page *spte);
+bool stack_growth(void* addr);
+struct page *find_spte (void *vaddr);
+
 static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
@@ -147,6 +154,44 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+  
+  if(!not_present)
+  {
+   exit(-1);
+  }
+
+  struct page *spte = find_spte(fault_addr);  // fault_addr에 대응하는 SPT 엔트리 조회
+  
+  if (!spte)  // spte가 NULL이면: 페이지 정보가 SPT에 없음
+  {
+    if (!is_user_vaddr(fault_addr))  // fault_addr가 유저 영역 주소가 아니면
+      exit(-1);  // 잘못된 주소 접근이므로 프로세스 종료
+
+    if (fault_addr >= f->esp - 32)  // fault_addr가 esp 근처라면 (스택 확장 조건)
+    {
+      if (!stack_growth(fault_addr))  // 스택 확장 시도
+      {
+        exit(-1);  // 스택 확장 실패 시 프로세스 종료
+      }
+    }
+    else  // 스택 확장 조건에도 해당하지 않음
+    {
+      exit(-1);  // 잘못된 접근이므로 프로세스 종료
+    }
+  }
+  else  // spte가 존재하는 경우 lazy load 또는 swap-in 대상
+  {
+    if (write && !(spte->write_enable))  // 쓰기 요청인데 해당 페이지가 쓰기 불가능한 경우
+    {
+      exit(-1);  // 권한 위반이므로 프로세스 종료
+    }
+
+    if (!handle_page_fault(spte))  // 실제 페이지 로드 처리 (lazy load or swap-in)
+    {
+      exit(-1);  // 로딩 실패 시 프로세스 종료
+    }
+  }
+  return;
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
