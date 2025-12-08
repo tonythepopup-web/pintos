@@ -5,17 +5,13 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#ifdef VM
 #include "vm/page.h"
-#endif
 #include "userprog/process.h"
 #include "userprog/syscall.h"
 
-#ifdef VM
 bool handle_page_fault (struct page *spte);
 bool stack_growth(void* addr);
 struct page *find_spte (void *vaddr);
-#endif
 
 static long long page_fault_cnt;
 
@@ -164,7 +160,6 @@ page_fault (struct intr_frame *f)
    exit(-1);
   }
 
-#ifdef VM
   struct page *spte = find_spte(fault_addr);  // fault_addr에 대응하는 SPT 엔트리 조회
   
   if (!spte)  // spte가 NULL이면: 페이지 정보가 SPT에 없음
@@ -197,13 +192,6 @@ page_fault (struct intr_frame *f)
     }
   }
   return;
-#else
-  /* No VM: user page faults should terminate the process */
-  if (user) {
-    exit(-1);
-  }
-#endif
-
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
      which fault_addr refers. */
